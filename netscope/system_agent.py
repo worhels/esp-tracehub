@@ -83,6 +83,14 @@ class SystemAgent:
                 try:
                     output = await loop.run_in_executor(None, self._run_netstat)
                     new_conns = self._parse_netstat(output)
+                    if self.paused:
+                        self.discarded_count += sum(
+                            1
+                            for conn in new_conns
+                            if f"{conn.get('proto')}|{conn.get('local')}|{conn.get('remote')}|{conn.get('pid')}"
+                            not in self._known_connections
+                        )
+                        continue
                     for conn in new_conns:
                         key = f"{conn.get('proto')}|{conn.get('local')}|{conn.get('remote')}|{conn.get('pid')}"
                         if key not in self._known_connections:
@@ -94,6 +102,8 @@ class SystemAgent:
                     self._netstat_error_reported = False
                     self._last_netstat_success = f"netstat poll at {time.strftime('%H:%M:%S')}"
                 except Exception as exc:
+                    if self.paused:
+                        continue
                     self._netstat_failures += 1
                     await self._emit_status(f"netstat error: {exc}", "warning")
                     if (
@@ -193,34 +203,41 @@ class SystemAgent:
     async def _dns_loop(self) -> None:
         loop = asyncio.get_running_loop()
         try:
-
-            try:
-                initial = await loop.run_in_executor(None, self._run_dns_cache)
-                for entry in self._parse_dns_cache(initial):
-                    key = f"{entry.get('domain')}|{entry.get('ip')}"
-                    self._known_dns.add(key)
-                self._dns_failures = 0
-                self._dns_error_reported = False
-                self._last_dns_success = f"DNS baseline at {time.strftime('%H:%M:%S')} ({len(self._known_dns)} entries)"
-                await self._emit_status(
-                    f"DNS cache baseline: {len(self._known_dns)} entries", "info"
-                )
-            except Exception as exc:
-                self._dns_failures += 1
-                await self._emit_status(f"DNS cache baseline error: {exc}", "warning")
-                if (
-                    self.error_mgr
-                    and self._dns_failures >= self._FAILURE_THRESHOLD
-                    and not self._dns_error_reported
-                ):
-                    self._dns_error_reported = True
-                    await self.error_mgr.record(
-                        agent="System",
-                        step="dns_cache_baseline",
-                        exc=exc,
-                        message=f"DNS cache baseline failed: {exc}",
-                        last_success=self._last_dns_success or "None confirmed",
+            while True:
+                if self.paused:
+                    await asyncio.sleep(0.1)
+                    continue
+                try:
+                    initial = await loop.run_in_executor(None, self._run_dns_cache)
+                    for entry in self._parse_dns_cache(initial):
+                        key = f"{entry.get('domain')}|{entry.get('ip')}"
+                        self._known_dns.add(key)
+                    self._dns_failures = 0
+                    self._dns_error_reported = False
+                    self._last_dns_success = f"DNS baseline at {time.strftime('%H:%M:%S')} ({len(self._known_dns)} entries)"
+                    await self._emit_status(
+                        f"DNS cache baseline: {len(self._known_dns)} entries", "info"
                     )
+                    break
+                except Exception as exc:
+                    if self.paused:
+                        continue
+                    self._dns_failures += 1
+                    await self._emit_status(f"DNS cache baseline error: {exc}", "warning")
+                    if (
+                        self.error_mgr
+                        and self._dns_failures >= self._FAILURE_THRESHOLD
+                        and not self._dns_error_reported
+                    ):
+                        self._dns_error_reported = True
+                        await self.error_mgr.record(
+                            agent="System",
+                            step="dns_cache_baseline",
+                            exc=exc,
+                            message=f"DNS cache baseline failed: {exc}",
+                            last_success=self._last_dns_success or "None confirmed",
+                        )
+                    break
 
             while True:
                 await asyncio.sleep(self.poll_interval * 2)
@@ -229,6 +246,13 @@ class SystemAgent:
                 try:
                     output = await loop.run_in_executor(None, self._run_dns_cache)
                     entries = self._parse_dns_cache(output)
+                    if self.paused:
+                        self.discarded_count += sum(
+                            1
+                            for entry in entries
+                            if f"{entry.get('domain')}|{entry.get('ip')}" not in self._known_dns
+                        )
+                        continue
                     for entry in entries:
                         key = f"{entry.get('domain')}|{entry.get('ip')}"
                         if key not in self._known_dns:
@@ -240,6 +264,8 @@ class SystemAgent:
                     self._dns_error_reported = False
                     self._last_dns_success = f"DNS cache poll at {time.strftime('%H:%M:%S')}"
                 except Exception as exc:
+                    if self.paused:
+                        continue
                     self._dns_failures += 1
                     await self._emit_status(f"DNS cache error: {exc}", "warning")
                     if (

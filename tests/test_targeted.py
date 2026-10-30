@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from netscope.error_manager import ErrorManager
 from netscope.esp_agent import ESPAgent
 from netscope.capture_agent import CaptureAgent
+from netscope.event_engine import EventEngine
 from netscope.models import Source, NetEvent, AlertLevel
 from netscope.netview import NetScopeApp
 from netscope.system_agent import SystemAgent
@@ -261,9 +262,10 @@ class TestTargeted(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(app._session_paused)
         self.assertTrue(app.paused)
 
-        app.esp_agent = ESPAgent(app.event_engine.input_queue, error_mgr=app.error_mgr, port="COM3")
-        app.esp_agent.paused = True
-        app.esp_agent.status.connected = True
+        esp_agent = ESPAgent(app.event_engine.input_queue, error_mgr=app.error_mgr, port="COM3")
+        app.esp_agent = esp_agent
+        esp_agent.paused = True
+        esp_agent.status.connected = True
 
         esp_lines = [
             b"EVT:BEACON MAC:AA:BB:CC:DD:EE:FF RSSI:-50 CHAN:1 SSID:TestNet\r\n",
@@ -277,19 +279,20 @@ class TestTargeted(unittest.IsolatedAsyncioTestCase):
                 line = esp_lines[esp_idx]
                 esp_idx += 1
                 return line
-            app.esp_agent._stopping = True
+            esp_agent._stopping = True
             return b""
 
         mock_esp_ser = MagicMock()
         mock_esp_ser.readline = mock_esp_readline
-        app.esp_agent._serial = mock_esp_ser
+        esp_agent._serial = mock_esp_ser
 
-        await app.esp_agent._read_loop()
-        self.assertEqual(app.esp_agent.discarded_count, 2)
+        await esp_agent._read_loop()
+        self.assertEqual(esp_agent.discarded_count, 2)
 
-        app.capture_agent = CaptureAgent(app.event_engine.input_queue, error_mgr=app.error_mgr)
-        app.capture_agent._tshark_path = "tshark"
-        app.capture_agent.paused = True
+        capture_agent = CaptureAgent(app.event_engine.input_queue, error_mgr=app.error_mgr)
+        app.capture_agent = capture_agent
+        capture_agent._tshark_path = "tshark"
+        capture_agent.paused = True
 
         tshark_lines = [
             "0.1|192.168.1.10|1.1.1.1|1234|53|||DNS|query example.com\n",
@@ -303,7 +306,7 @@ class TestTargeted(unittest.IsolatedAsyncioTestCase):
                 line = tshark_lines[ts_idx]
                 ts_idx += 1
                 return line
-            app.capture_agent._stopping = True
+            capture_agent._stopping = True
             return ""
 
         mock_proc = MagicMock()
@@ -317,8 +320,10 @@ class TestTargeted(unittest.IsolatedAsyncioTestCase):
         output_q_size = app.event_engine.output_queue.qsize()
 
         with patch("subprocess.Popen", return_value=mock_proc):
-            await app.capture_agent._capture_loop()
-        self.assertEqual(app.capture_agent.discarded_count, 2)
+            with patch.object(capture_agent, "_parse_line", wraps=capture_agent._parse_line) as parse_line:
+                await capture_agent._capture_loop()
+        self.assertEqual(capture_agent.discarded_count, 2)
+        parse_line.assert_not_called()
 
         self.assertEqual(app.event_engine.input_queue.qsize(), input_q_size)
         self.assertEqual(app.event_engine.output_queue.qsize(), output_q_size)
@@ -345,6 +350,7 @@ class TestTargeted(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(app.paused)
 
         async def mock_start_connected(self_agent):
+            self.assertTrue(self_agent.paused)
             self_agent.status.connected = True
 
         with patch.object(ESPAgent, "start", mock_start_connected):
@@ -421,13 +427,122 @@ class TestTargeted(unittest.IsolatedAsyncioTestCase):
 
     async def test_quit_stops_all_agents_and_tasks(self):
         app = NetScopeApp(no_tshark=True, no_esp=True)
-        await app._start_agents()
+        async with app.run_test() as pilot:
+            assert app.system_agent is not None
+            self.assertTrue(app.system_agent.status.connected)
+            await pilot.press("q")
+            await pilot.pause()
 
-        self.assertTrue(app.system_agent.status.connected)
-        await app._stop_agents()
-
+        assert app.system_agent is not None
         self.assertFalse(app.system_agent.status.connected)
         self.assertFalse(app.event_engine._running)
+
+    async def test_event_engine_discards_input_if_paused_while_waiting(self):
+        engine = EventEngine()
+        await engine.start()
+        await asyncio.sleep(0.05)
+
+        engine.pause()
+        engine.input_queue.put_nowait({"_source": "system_conn", "remote": "1.1.1.1:443"})
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(engine.output_queue.qsize(), 0)
+        self.assertGreaterEqual(engine.discarded_count, 1)
+        await engine.stop()
+
+    async def test_consumer_discards_output_if_paused_while_waiting(self):
+        app = NetScopeApp(no_tshark=True, no_esp=True)
+        task = asyncio.create_task(app._consume_events())
+        await asyncio.sleep(0.05)
+
+        app._pause_session()
+        event = NetEvent(
+            source=Source.PC,
+            who="test",
+            where="test",
+            what="test",
+            alert_level=AlertLevel.INFO,
+        )
+        app.event_engine.output_queue.put_nowait(event)
+        await asyncio.sleep(0.05)
+
+        self.assertEqual(app._events, [])
+        self.assertEqual(app.event_engine.output_queue.qsize(), 0)
+        self.assertEqual(app._paused_discarded_count, 1)
+
+        task.cancel()
+        await task
+
+    async def test_system_netstat_result_is_discarded_if_paused_in_flight(self):
+        queue: asyncio.Queue = asyncio.Queue()
+        agent = SystemAgent(queue, poll_interval=0.01)
+        loop = asyncio.get_running_loop()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_executor(executor, func):
+            entered.set()
+            await release.wait()
+            return "snapshot"
+
+        connections = [{
+            "_source": "system_conn",
+            "proto": "TCP",
+            "local": "192.168.1.2:5000",
+            "remote": "1.1.1.1:443",
+            "pid": "42",
+        }]
+        with patch.object(loop, "run_in_executor", side_effect=delayed_executor):
+            with patch.object(agent, "_parse_netstat", return_value=connections):
+                task = asyncio.create_task(agent._netstat_loop())
+                await asyncio.wait_for(entered.wait(), timeout=1)
+                agent.pause()
+                release.set()
+                await asyncio.sleep(0.05)
+
+                self.assertTrue(queue.empty())
+                self.assertEqual(agent.discarded_count, 1)
+
+                task.cancel()
+                await task
+
+    async def test_system_dns_result_is_discarded_if_paused_in_flight(self):
+        queue: asyncio.Queue = asyncio.Queue()
+        agent = SystemAgent(queue, poll_interval=0.01)
+        loop = asyncio.get_running_loop()
+        poll_started = asyncio.Event()
+        release_poll = asyncio.Event()
+        calls = 0
+
+        async def delayed_executor(executor, func):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return "baseline"
+            poll_started.set()
+            await release_poll.wait()
+            return "poll"
+
+        new_entries = [{
+            "_source": "system_dns",
+            "domain": "example.test",
+            "ip": "192.0.2.10",
+        }]
+        with patch.object(loop, "run_in_executor", side_effect=delayed_executor):
+            with patch.object(agent, "_parse_dns_cache", side_effect=[[], new_entries]):
+                task = asyncio.create_task(agent._dns_loop())
+                await asyncio.wait_for(poll_started.wait(), timeout=1)
+                while not queue.empty():
+                    queue.get_nowait()
+                agent.pause()
+                release_poll.set()
+                await asyncio.sleep(0.05)
+
+                self.assertTrue(queue.empty())
+                self.assertEqual(agent.discarded_count, 1)
+
+                task.cancel()
+                await task
 
 
 if __name__ == "__main__":

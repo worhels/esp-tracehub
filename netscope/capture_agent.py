@@ -207,11 +207,12 @@ class CaptureAgent:
                 if not line_str:
                     continue
 
+                if self.paused:
+                    self.discarded_count += 1
+                    continue
+
                 raw = self._parse_line(line_str)
                 if raw:
-                    if self.paused:
-                        self.discarded_count += 1
-                        continue
                     self.status.events_count += 1
                     self.status.last_event_time = time.time()
                     self._last_success = f"Packet parsed at {time.strftime('%H:%M:%S')}"

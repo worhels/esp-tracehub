@@ -250,6 +250,7 @@ class NetScopeApp(App):
         self.esp_agent: ESPAgent | None = None
         self._session_paused: bool = False
         self._pause_start_time: float | None = None
+        self._paused_discarded_count: int = 0
 
 
 
@@ -353,6 +354,7 @@ class NetScopeApp(App):
             port=self.esp_port,
             disabled=self.no_esp,
         )
+        self.esp_agent.paused = self._session_paused
         try:
             await self.esp_agent.start()
             if not self.esp_agent.status.connected:
@@ -373,6 +375,7 @@ class NetScopeApp(App):
             interface=self.tshark_interface,
             disabled=self.no_tshark,
         )
+        self.capture_agent.paused = self._session_paused
         try:
             await self.capture_agent.start()
             if not self.capture_agent.status.connected:
@@ -388,6 +391,7 @@ class NetScopeApp(App):
         if self.system_agent:
             await self.system_agent.stop()
         self.system_agent = SystemAgent(self.event_engine.input_queue, error_mgr=self.error_mgr)
+        self.system_agent.paused = self._session_paused
         try:
             await self.system_agent.start()
             if not self.system_agent.status.connected:
@@ -404,6 +408,7 @@ class NetScopeApp(App):
         self._session_paused = True
         self._pause_start_time = time.time()
         self.paused = True
+        self._paused_discarded_count = 0
         for agent in (self.esp_agent, self.capture_agent, self.system_agent):
             if agent:
                 agent.pause()
@@ -416,12 +421,13 @@ class NetScopeApp(App):
         self._session_paused = False
         pause_start = self._pause_start_time or time.time()
         pause_duration = max(0, int(time.time() - pause_start))
-        total_discarded = 0
+        total_discarded = self._paused_discarded_count
         for agent in (self.esp_agent, self.capture_agent, self.system_agent):
             if agent:
                 total_discarded += getattr(agent, "discarded_count", 0)
                 agent.resume()
         if self.event_engine:
+            total_discarded += self.event_engine.discarded_count
             self.event_engine.resume()
         self.paused = False
         start_str = time.strftime("%H:%M:%S", time.localtime(pause_start))
@@ -454,6 +460,10 @@ class NetScopeApp(App):
                         self.event_engine.output_queue.get(), timeout=0.3
                     )
                 except TimeoutError:
+                    continue
+
+                if self._session_paused:
+                    self._paused_discarded_count += 1
                     continue
 
                 self._events.append(event)

@@ -63,13 +63,27 @@ class EventEngine:
         self.output_queue: asyncio.Queue[NetEvent] = asyncio.Queue()
         self._running = False
         self.paused = False
+        self.discarded_count = 0
         self._task: asyncio.Task[None] | None = None
 
     def pause(self) -> None:
         self.paused = True
+        self.discarded_count += self._drain_queue(self.input_queue)
+        self.discarded_count += self._drain_queue(self.output_queue)
 
     def resume(self) -> None:
         self.paused = False
+        self.discarded_count = 0
+
+    @staticmethod
+    def _drain_queue(queue: asyncio.Queue[Any]) -> int:
+        drained = 0
+        while True:
+            try:
+                queue.get_nowait()
+                drained += 1
+            except asyncio.QueueEmpty:
+                return drained
 
     async def start(self) -> None:
         self._running = True
@@ -95,6 +109,9 @@ class EventEngine:
                 continue
             except asyncio.CancelledError:
                 break
+            if self.paused:
+                self.discarded_count += 1
+                continue
             try:
                 events = self._transform(raw)
                 for ev in events:
