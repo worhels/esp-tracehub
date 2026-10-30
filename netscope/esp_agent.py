@@ -39,6 +39,7 @@ class ESPAgent:
         self._stopping = False
         self._last_success: str = ""
         self._last_heartbeat_time: float = 0.0
+        self._last_step_context: str = ""
 
 
 
@@ -198,8 +199,6 @@ class ESPAgent:
                 if not raw_line:
                     continue
 
-                self._last_heartbeat_time = time.time()
-
                 try:
                     line = raw_line.decode("utf-8", errors="replace").strip()
                 except Exception:
@@ -208,12 +207,21 @@ class ESPAgent:
                 if not line:
                     continue
 
+                m_step_ctx = re.search(r"STEP=([a-zA-Z0-9_\-]+)", line)
+                if m_step_ctx and m_step_ctx.group(1).lower() != "none":
+                    self._last_step_context = m_step_ctx.group(1)
+
+                if line.startswith("TRUE") or line.startswith("CANCELLED"):
+                    self._last_step_context = ""
+
                 if line.startswith("EVT:"):
                     event = self._parse_evt(line)
                     if event:
                         self.status.events_count += 1
                         self.status.last_event_time = time.time()
                         evt_type = event.get("type", "event")
+                        if evt_type == "heartbeat":
+                            self._last_heartbeat_time = time.time()
                         self._last_success = f"Received {evt_type} at {time.strftime('%H:%M:%S')}"
                         await self.output_queue.put(event)
 
@@ -236,6 +244,10 @@ class ESPAgent:
         m_step = re.search(r"STEP=([a-zA-Z0-9_\-]+)", line)
         if m_step:
             step = m_step.group(1)
+        elif self._last_step_context:
+            step = self._last_step_context
+
+        self._last_step_context = ""
 
         m_err = re.search(r"ERROR=([a-zA-Z0-9_\-]+)", line)
         err_code = m_err.group(1) if m_err else line

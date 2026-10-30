@@ -311,7 +311,7 @@ class NetScopeApp(App):
         await self.event_engine.start()
 
 
-        self.system_agent = SystemAgent(raw_q)
+        self.system_agent = SystemAgent(raw_q, error_mgr=self.error_mgr)
         try:
             await self.system_agent.start()
         except Exception as exc:
@@ -377,7 +377,7 @@ class NetScopeApp(App):
         """Retry only the local system agent."""
         if self.system_agent:
             await self.system_agent.stop()
-        self.system_agent = SystemAgent(self.event_engine.input_queue)
+        self.system_agent = SystemAgent(self.event_engine.input_queue, error_mgr=self.error_mgr)
         try:
             await self.system_agent.start()
             self._log_write("[green]✓ System agent retry started[/green]")

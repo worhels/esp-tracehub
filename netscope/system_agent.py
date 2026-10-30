@@ -8,6 +8,7 @@ import subprocess
 import time
 from typing import Any
 
+from .error_manager import ErrorManager
 from .models import AgentStatus
 
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -20,18 +21,28 @@ class SystemAgent:
     into *output_queue*.
     """
 
+    _FAILURE_THRESHOLD = 3
+
     def __init__(
         self,
         output_queue: asyncio.Queue[dict[str, Any]],
         poll_interval: float = 5.0,
+        error_mgr: ErrorManager | None = None,
     ) -> None:
         self.output_queue = output_queue
         self.poll_interval = poll_interval
+        self.error_mgr = error_mgr
         self.status = AgentStatus(name="System")
         self._task: asyncio.Task | None = None
         self._dns_task: asyncio.Task | None = None
         self._known_connections: set[str] = set()
         self._known_dns: set[str] = set()
+        self._netstat_failures: int = 0
+        self._netstat_error_reported: bool = False
+        self._dns_failures: int = 0
+        self._dns_error_reported: bool = False
+        self._last_netstat_success: str = ""
+        self._last_dns_success: str = ""
 
 
 
@@ -67,27 +78,42 @@ class SystemAgent:
                             self.status.events_count += 1
                             self.status.last_event_time = time.time()
                             await self.output_queue.put(conn)
+                    self._netstat_failures = 0
+                    self._netstat_error_reported = False
+                    self._last_netstat_success = f"netstat poll at {time.strftime('%H:%M:%S')}"
                 except Exception as exc:
+                    self._netstat_failures += 1
                     await self._emit_status(f"netstat error: {exc}", "warning")
+                    if (
+                        self.error_mgr
+                        and self._netstat_failures >= self._FAILURE_THRESHOLD
+                        and not self._netstat_error_reported
+                    ):
+                        self._netstat_error_reported = True
+                        await self.error_mgr.record(
+                            agent="System",
+                            step="netstat_poll",
+                            exc=exc,
+                            message=f"netstat failed {self._netstat_failures} times consecutively: {exc}",
+                            last_success=self._last_netstat_success or "None confirmed",
+                        )
                 await asyncio.sleep(self.poll_interval)
         except asyncio.CancelledError:
             pass
 
     @staticmethod
     def _run_netstat() -> str:
-        try:
-            result = subprocess.run(
-                ["netstat", "-ano"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                creationflags=_CREATE_NO_WINDOW,
-            )
-            return result.stdout
-        except FileNotFoundError:
-            return ""
-        except subprocess.TimeoutExpired:
-            return ""
+        result = subprocess.run(
+            ["netstat", "-ano"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+        if result.returncode != 0:
+            err = result.stderr.strip() or f"exit code {result.returncode}"
+            raise RuntimeError(f"netstat failed: {err}")
+        return result.stdout
 
     def _parse_netstat(self, output: str) -> list[dict[str, Any]]:
         """Parse netstat -ano output into connection dicts."""
@@ -161,11 +187,28 @@ class SystemAgent:
                 for entry in self._parse_dns_cache(initial):
                     key = f"{entry.get('domain')}|{entry.get('ip')}"
                     self._known_dns.add(key)
-            except Exception:
-                pass
-            await self._emit_status(
-                f"DNS cache baseline: {len(self._known_dns)} entries", "info"
-            )
+                self._dns_failures = 0
+                self._dns_error_reported = False
+                self._last_dns_success = f"DNS baseline at {time.strftime('%H:%M:%S')} ({len(self._known_dns)} entries)"
+                await self._emit_status(
+                    f"DNS cache baseline: {len(self._known_dns)} entries", "info"
+                )
+            except Exception as exc:
+                self._dns_failures += 1
+                await self._emit_status(f"DNS cache baseline error: {exc}", "warning")
+                if (
+                    self.error_mgr
+                    and self._dns_failures >= self._FAILURE_THRESHOLD
+                    and not self._dns_error_reported
+                ):
+                    self._dns_error_reported = True
+                    await self.error_mgr.record(
+                        agent="System",
+                        step="dns_cache_baseline",
+                        exc=exc,
+                        message=f"DNS cache baseline failed: {exc}",
+                        last_success=self._last_dns_success or "None confirmed",
+                    )
 
             while True:
                 await asyncio.sleep(self.poll_interval * 2)
@@ -179,24 +222,41 @@ class SystemAgent:
                             self.status.events_count += 1
                             self.status.last_event_time = time.time()
                             await self.output_queue.put(entry)
+                    self._dns_failures = 0
+                    self._dns_error_reported = False
+                    self._last_dns_success = f"DNS cache poll at {time.strftime('%H:%M:%S')}"
                 except Exception as exc:
+                    self._dns_failures += 1
                     await self._emit_status(f"DNS cache error: {exc}", "warning")
+                    if (
+                        self.error_mgr
+                        and self._dns_failures >= self._FAILURE_THRESHOLD
+                        and not self._dns_error_reported
+                    ):
+                        self._dns_error_reported = True
+                        await self.error_mgr.record(
+                            agent="System",
+                            step="dns_cache_poll",
+                            exc=exc,
+                            message=f"DNS cache poll failed {self._dns_failures} times consecutively: {exc}",
+                            last_success=self._last_dns_success or "None confirmed",
+                        )
         except asyncio.CancelledError:
             pass
 
     @staticmethod
     def _run_dns_cache() -> str:
-        try:
-            result = subprocess.run(
-                ["ipconfig", "/displaydns"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                creationflags=_CREATE_NO_WINDOW,
-            )
-            return result.stdout
-        except Exception:
-            return ""
+        result = subprocess.run(
+            ["ipconfig", "/displaydns"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+        if result.returncode != 0:
+            err = result.stderr.strip() or f"exit code {result.returncode}"
+            raise RuntimeError(f"ipconfig /displaydns failed: {err}")
+        return result.stdout
 
     @staticmethod
     def _parse_dns_cache(output: str) -> list[dict[str, Any]]:
