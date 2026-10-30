@@ -43,6 +43,8 @@ class SystemAgent:
         self._dns_error_reported: bool = False
         self._last_netstat_success: str = ""
         self._last_dns_success: str = ""
+        self.paused: bool = False
+        self.discarded_count: int = 0
 
 
 
@@ -62,12 +64,22 @@ class SystemAgent:
                     pass
         self.status.connected = False
 
+    def pause(self) -> None:
+        self.paused = True
+
+    def resume(self) -> None:
+        self.paused = False
+        self.discarded_count = 0
+
 
 
     async def _netstat_loop(self) -> None:
         loop = asyncio.get_running_loop()
         try:
             while True:
+                if self.paused:
+                    await asyncio.sleep(self.poll_interval)
+                    continue
                 try:
                     output = await loop.run_in_executor(None, self._run_netstat)
                     new_conns = self._parse_netstat(output)
@@ -212,6 +224,8 @@ class SystemAgent:
 
             while True:
                 await asyncio.sleep(self.poll_interval * 2)
+                if self.paused:
+                    continue
                 try:
                     output = await loop.run_in_executor(None, self._run_dns_cache)
                     entries = self._parse_dns_cache(output)
@@ -283,6 +297,8 @@ class SystemAgent:
         return results
 
     async def _emit_status(self, message: str, level: str = "info") -> None:
+        if self.paused:
+            return
         await self.output_queue.put({
             "_source": "status",
             "agent": "System",

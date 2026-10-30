@@ -109,6 +109,23 @@ class ErrorManager:
     def unresolved(self) -> list[ErrorRecord]:
         return [e for e in self.errors if not e.resolved]
 
+    def drain_agent_errors(self, agent: str) -> list[ErrorRecord]:
+        remaining: list[ErrorRecord] = []
+        drained: list[ErrorRecord] = []
+        while not self.error_queue.empty():
+            try:
+                err = self.error_queue.get_nowait()
+                if err.agent == agent:
+                    err.resolved = True
+                    drained.append(err)
+                else:
+                    remaining.append(err)
+            except asyncio.QueueEmpty:
+                break
+        for err in remaining:
+            self.error_queue.put_nowait(err)
+        return drained
+
     def diagnostics(self) -> str:
         """Generate a diagnostics report string."""
         lines = [

@@ -40,6 +40,8 @@ class ESPAgent:
         self._last_success: str = ""
         self._last_heartbeat_time: float = 0.0
         self._last_step_context: str = ""
+        self.paused: bool = False
+        self.discarded_count: int = 0
 
 
 
@@ -141,6 +143,14 @@ class ESPAgent:
         self._serial = None
         self.status.connected = False
 
+    def pause(self) -> None:
+        self.paused = True
+
+    def resume(self) -> None:
+        self.paused = False
+        self._last_heartbeat_time = time.time()
+        self.discarded_count = 0
+
 
 
     async def _heartbeat_watchdog(self) -> None:
@@ -150,6 +160,9 @@ class ESPAgent:
                 await asyncio.sleep(1.0)
                 if not self.status.connected or self._stopping:
                     break
+
+                if self.paused:
+                    continue
 
                 elapsed = time.time() - self._last_heartbeat_time
                 if elapsed > 6.0:
@@ -222,6 +235,9 @@ class ESPAgent:
                         evt_type = event.get("type", "event")
                         if evt_type == "heartbeat":
                             self._last_heartbeat_time = time.time()
+                        if self.paused:
+                            self.discarded_count += 1
+                            continue
                         self._last_success = f"Received {evt_type} at {time.strftime('%H:%M:%S')}"
                         await self.output_queue.put(event)
 
@@ -325,6 +341,8 @@ class ESPAgent:
         return data
 
     async def _emit_status(self, message: str, level: str = "info") -> None:
+        if self.paused:
+            return
         await self.output_queue.put({
             "_source": "status",
             "agent": "ESP32",

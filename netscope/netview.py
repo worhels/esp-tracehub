@@ -248,6 +248,8 @@ class NetScopeApp(App):
         self.capture_agent: CaptureAgent | None = None
         self.system_agent: SystemAgent | None = None
         self.esp_agent: ESPAgent | None = None
+        self._session_paused: bool = False
+        self._pause_start_time: float | None = None
 
 
 
@@ -341,7 +343,7 @@ class NetScopeApp(App):
         except Exception as exc:
             await self.error_mgr.record("ESP32", "start", exc)
 
-    async def _retry_esp(self) -> None:
+    async def _retry_esp(self) -> bool:
         """Retry only the ESP32 connection and sniffer."""
         if self.esp_agent:
             await self.esp_agent.stop()
@@ -353,11 +355,15 @@ class NetScopeApp(App):
         )
         try:
             await self.esp_agent.start()
+            if not self.esp_agent.status.connected:
+                return False
             self._log_write(f"[green]✓ ESP32 retry started on {self.esp_port}[/green]")
+            return True
         except Exception as exc:
             await self.error_mgr.record("ESP32", "retry_start", exc)
+            return False
 
-    async def _retry_tshark(self) -> None:
+    async def _retry_tshark(self) -> bool:
         """Retry only the TShark capture agent."""
         if self.capture_agent:
             await self.capture_agent.stop()
@@ -369,20 +375,61 @@ class NetScopeApp(App):
         )
         try:
             await self.capture_agent.start()
+            if not self.capture_agent.status.connected:
+                return False
             self._log_write("[green]✓ TShark capture retry started[/green]")
+            return True
         except Exception as exc:
             await self.error_mgr.record("TShark", "retry_start", exc)
+            return False
 
-    async def _retry_system(self) -> None:
+    async def _retry_system(self) -> bool:
         """Retry only the local system agent."""
         if self.system_agent:
             await self.system_agent.stop()
         self.system_agent = SystemAgent(self.event_engine.input_queue, error_mgr=self.error_mgr)
         try:
             await self.system_agent.start()
+            if not self.system_agent.status.connected:
+                return False
             self._log_write("[green]✓ System agent retry started[/green]")
+            return True
         except Exception as exc:
             await self.error_mgr.record("System", "retry_start", exc)
+            return False
+
+    def _pause_session(self) -> None:
+        if self._session_paused:
+            return
+        self._session_paused = True
+        self._pause_start_time = time.time()
+        self.paused = True
+        for agent in (self.esp_agent, self.capture_agent, self.system_agent):
+            if agent:
+                agent.pause()
+        if self.event_engine:
+            self.event_engine.pause()
+
+    def _resume_session(self) -> None:
+        if not self._session_paused:
+            return
+        self._session_paused = False
+        pause_start = self._pause_start_time or time.time()
+        pause_duration = max(0, int(time.time() - pause_start))
+        total_discarded = 0
+        for agent in (self.esp_agent, self.capture_agent, self.system_agent):
+            if agent:
+                total_discarded += getattr(agent, "discarded_count", 0)
+                agent.resume()
+        if self.event_engine:
+            self.event_engine.resume()
+        self.paused = False
+        start_str = time.strftime("%H:%M:%S", time.localtime(pause_start))
+        now_str = time.strftime("%H:%M:%S")
+        self._log_write(
+            f"[yellow]▶ Resumed session (paused {start_str} -> {now_str}, "
+            f"duration {pause_duration}s, {total_discarded} events discarded)[/yellow]"
+        )
 
     async def _stop_agents(self) -> None:
         for agent in (self.capture_agent, self.system_agent, self.esp_agent):
@@ -399,6 +446,9 @@ class NetScopeApp(App):
         """Read NetEvents from the engine's output queue and display them."""
         try:
             while True:
+                if self._session_paused:
+                    await asyncio.sleep(0.1)
+                    continue
                 try:
                     event = await asyncio.wait_for(
                         self.event_engine.output_queue.get(), timeout=0.3
@@ -437,8 +487,7 @@ class NetScopeApp(App):
                     continue
 
 
-                prev_paused = self.paused
-                self.paused = True
+                self._pause_session()
                 self._log_write(f"[bold red]⛔ HALTED: Error in [{error.agent}] at step '{error.step}'[/bold red]")
 
                 result = await self.push_screen_wait(
@@ -446,23 +495,31 @@ class NetScopeApp(App):
                 )
 
                 if result == "quit":
+                    await self._stop_agents()
                     self.exit()
                 elif result == "retry":
+                    self.error_mgr.drain_agent_errors(error.agent)
                     self._log_write(f"[yellow]⟳ Retrying [{error.agent}] (step: {error.step})…[/yellow]")
+                    success = False
                     if error.agent == "ESP32":
-                        await self._retry_esp()
+                        success = await self._retry_esp()
                     elif error.agent == "TShark":
-                        await self._retry_tshark()
+                        success = await self._retry_tshark()
                     elif error.agent == "System":
-                        await self._retry_system()
+                        success = await self._retry_system()
                     else:
                         self._log_write(f"[yellow]No isolated retry procedure for '{error.agent}'.[/yellow]")
-                    self.paused = prev_paused
+
+                    if success:
+                        self._resume_session()
+                    else:
+                        self._log_write(f"[bold red]✖ Retry failed for [{error.agent}]. Session remains HALTED.[/bold red]")
                 elif result == "dismiss":
-                    self.paused = prev_paused
+                    self.error_mgr.drain_agent_errors(error.agent)
                     self._log_write(f"[dim]Error in [{error.agent}] dismissed by user. Continuing…[/dim]")
+                    self._resume_session()
                 else:
-                    self.paused = prev_paused
+                    self._resume_session()
         except asyncio.CancelledError:
             pass
 
@@ -531,7 +588,12 @@ class NetScopeApp(App):
         pc = dot(self.system_agent, "PC")
         esp = dot(self.esp_agent, "ESP32")
         ts = dot(self.capture_agent, "TSHARK")
-        pause_str = "  [bold red]⏸ PAUSED[/bold red]" if self.paused else ""
+        if self._session_paused:
+            pause_str = "  [bold red]⛔ HALTED (events discarded)[/bold red]"
+        elif self.paused:
+            pause_str = "  [bold red]⏸ PAUSED[/bold red]"
+        else:
+            pause_str = ""
         return f"  {pc}   {esp}   {ts}{pause_str}"
 
     def _build_status_bar(self) -> str:
@@ -549,7 +611,7 @@ class NetScopeApp(App):
         try:
             log = self.query_one("#event-log", RichLog)
             log.write(text)
-        except NoMatches:
+        except Exception:
             pass
 
     @staticmethod
@@ -597,6 +659,8 @@ class NetScopeApp(App):
         self._log_write("[dim]Log cleared[/dim]")
 
     def action_pause_resume(self) -> None:
-        self.paused = not self.paused
-        state = "PAUSED" if self.paused else "RESUMED"
-        self._log_write(f"[yellow]⏸ {state}[/yellow]")
+        if self._session_paused:
+            self._resume_session()
+        else:
+            self._pause_session()
+            self._log_write("[yellow]⏸ PAUSED[/yellow]")

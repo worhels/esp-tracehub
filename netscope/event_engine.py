@@ -62,7 +62,14 @@ class EventEngine:
         self.input_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.output_queue: asyncio.Queue[NetEvent] = asyncio.Queue()
         self._running = False
+        self.paused = False
         self._task: asyncio.Task[None] | None = None
+
+    def pause(self) -> None:
+        self.paused = True
+
+    def resume(self) -> None:
+        self.paused = False
 
     async def start(self) -> None:
         self._running = True
@@ -79,6 +86,9 @@ class EventEngine:
 
     async def _loop(self) -> None:
         while self._running:
+            if self.paused:
+                await asyncio.sleep(0.1)
+                continue
             try:
                 raw = await asyncio.wait_for(self.input_queue.get(), timeout=0.5)
             except TimeoutError:

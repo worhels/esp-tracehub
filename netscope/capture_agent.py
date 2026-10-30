@@ -55,6 +55,8 @@ class CaptureAgent:
         self._stopping = False
         self._last_success: str = ""
         self._stderr_lines: list[str] = []
+        self.paused: bool = False
+        self.discarded_count: int = 0
 
 
 
@@ -106,6 +108,13 @@ class CaptureAgent:
 
         self._proc = None
         self.status.connected = False
+
+    def pause(self) -> None:
+        self.paused = True
+
+    def resume(self) -> None:
+        self.paused = False
+        self.discarded_count = 0
 
 
 
@@ -200,6 +209,9 @@ class CaptureAgent:
 
                 raw = self._parse_line(line_str)
                 if raw:
+                    if self.paused:
+                        self.discarded_count += 1
+                        continue
                     self.status.events_count += 1
                     self.status.last_event_time = time.time()
                     self._last_success = f"Packet parsed at {time.strftime('%H:%M:%S')}"
@@ -291,6 +303,8 @@ class CaptureAgent:
         }
 
     async def _emit_status(self, message: str, level: str = "info") -> None:
+        if self.paused:
+            return
         await self.output_queue.put({
             "_source": "status",
             "agent": "TShark",
