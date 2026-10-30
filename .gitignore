@@ -1,0 +1,17 @@
+build/
+managed_components/
+.mypy_cache/
+.ruff_cache/
+**/__pycache__/
+*.py[cod]
+.venv/
+.env
+.vscode/settings.json
+.vscode/c_cpp_properties.json
+verification.txt
+events.txt
+events.json
+*.pcap
+*.pcapng
+backup/
+original-flash.bin
