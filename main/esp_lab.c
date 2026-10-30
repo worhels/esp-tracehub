@@ -20,6 +20,24 @@ static lab_state_t state = IDLE;
 static uint32_t required_mib = 16;
 static bool usb_step = false;
 
+static bool parse_mac_address(const char *text, uint8_t mac[6])
+{
+    unsigned int octets[6];
+    char trailing;
+    if (sscanf(text, "%2x:%2x:%2x:%2x:%2x:%2x%c",
+               &octets[0], &octets[1], &octets[2],
+               &octets[3], &octets[4], &octets[5], &trailing) != 6) {
+        return false;
+    }
+    for (size_t i = 0; i < 6; i++) {
+        if (octets[i] > 0xFF) {
+            return false;
+        }
+        mac[i] = (uint8_t)octets[i];
+    }
+    return true;
+}
+
 static void print_status(void)
 {
     const char *names[] = {"IDLE", "PASSED", "HALTED"};
@@ -65,6 +83,7 @@ static void handle_command(const char *command)
     if (strcmp(command, "help") == 0) {
         puts("help | status | usb-check | flash-check <1..128 MiB> | retry | cancel");
         puts("wifi-scan | wifi-stop | wifi-status");
+        puts("wifi-raw-start <channel 1..13> <BSSID> | wifi-raw-stop");
         puts("FALSE latches HALTED. No automatic retry. cancel returns to IDLE.");
     } else if (strcmp(command, "status") == 0) {
         print_status();
@@ -126,6 +145,24 @@ static void handle_command(const char *command)
         printf("WIFI_SNIFFER=%s\n", running ? "running" : "stopped");
         printf("EVT:STATS TOTAL_FRAMES=%" PRIu32 " UNIQUE_MACS=%" PRIu32 " DROPPED=%" PRIu32 " UPTIME=%" PRId64 "\n",
                st.total_frames, st.unique_macs, st.dropped_events, uptime_s);
+    } else if (strncmp(command, "wifi-raw-start ", 15) == 0) {
+        unsigned int channel = 0;
+        char bssid_text[18] = {0};
+        uint8_t bssid[6] = {0};
+        if (sscanf(command + 15, "%u %17s", &channel, bssid_text) != 2 ||
+            channel < 1 || channel > 13 || !parse_mac_address(bssid_text, bssid)) {
+            puts("ERROR=expected_channel_1_to_13_and_bssid");
+            return;
+        }
+        esp_err_t err = wifi_sniffer_raw_capture_start((uint8_t)channel, bssid);
+        if (err != ESP_OK) {
+            printf("ERROR=raw_capture_start_failed ERR=%s\n", esp_err_to_name(err));
+        }
+    } else if (strcmp(command, "wifi-raw-stop") == 0) {
+        esp_err_t err = wifi_sniffer_raw_capture_stop();
+        if (err != ESP_OK) {
+            printf("ERROR=raw_capture_stop_failed ERR=%s\n", esp_err_to_name(err));
+        }
     } else {
         puts("ERROR=unknown_command; use help");
     }

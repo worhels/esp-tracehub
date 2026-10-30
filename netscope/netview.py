@@ -7,17 +7,23 @@ an error overlay with interactive recovery, and a stats sidebar.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import re
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import (
+    Button,
     Footer,
     Header,
     RichLog,
@@ -46,11 +52,22 @@ Screen {
 }
 
 #sidebar {
-    width: 32;
+    width: 38;
     height: 100%;
     border-left: thick $accent;
     padding: 1;
+    overflow-y: auto;
 }
+
+#router-groups { height: 3; }
+#router-list { height: 1fr; border: round $primary; padding: 0 1; }
+.router-button { width: 100%; height: auto; min-height: 3; margin-bottom: 1; content-align: left middle; }
+#router-hint { height: auto; color: $text-muted; margin-bottom: 1; }
+RouterDetails { align: center middle; }
+#router-details { width: 72; height: auto; max-height: 85%; border: thick $accent; background: $surface; padding: 1 2; }
+#router-detail-body { height: auto; max-height: 1fr; margin: 1 0; }
+#router-detail-events { height: 12; border: round $primary; }
+#router-detail-actions { height: 3; }
 
 #status-bar {
     dock: bottom;
@@ -131,6 +148,95 @@ ErrorOverlay {
     text-style: bold;
 }
 """
+
+
+@dataclass
+class AccessPoint:
+    bssid: str
+    ssid: str
+    channel: str
+    rssi: str
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    observations: int = 0
+    data_frames: int = 0
+    clients: set[str] = field(default_factory=set)
+    recent_events: deque[str] = field(default_factory=lambda: deque(maxlen=20))
+
+
+def _safe_text(value: object, limit: int = 48) -> str:
+    text = str(value)
+    text = "".join(char if char.isprintable() else "�" for char in text)
+    return text[:limit] or "(hidden SSID)"
+
+
+class RouterDetails(ModalScreen[str]):
+    BINDINGS = [Binding("escape", "close", "Close", show=True)]
+
+    def __init__(self, ap: AccessPoint, is_home: bool, capture_active: bool = False) -> None:
+        super().__init__()
+        self.ap = ap
+        self.is_home = is_home
+        self.capture_active = capture_active
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="router-details"):
+            yield Static("Wi-Fi access point", classes="section-title")
+            yield Static(self._description(), id="router-detail-body", markup=False)
+            yield RichLog(id="router-detail-events", markup=False, wrap=True, max_lines=20)
+            if self.is_home and self.capture_active:
+                yield Button("Stop raw PCAP capture", id="router-capture-stop", variant="error")
+            elif self.is_home:
+                yield Button("Start raw PCAP capture", id="router-capture-start", variant="success")
+            else:
+                yield Static("Raw capture is limited to the AP marked as My router.")
+            yield Button("Remove from My router" if self.is_home else "Set as My router", id="router-home-toggle", variant="primary")
+            yield Button("Close", id="router-close")
+
+    def _description(self) -> str:
+        return (
+            f"SSID: {_safe_text(self.ap.ssid)}\nBSSID: {self.ap.bssid}\n"
+            f"Channel: {self.ap.channel}   Latest RSSI: {self.ap.rssi} dBm\n"
+            f"AP advertisements: {self.ap.observations}   Sampled data frames: {self.ap.data_frames}\n"
+            f"Heard client addresses: {len(self.ap.clients)}\n"
+            f"First seen: {time.strftime('%H:%M:%S', time.localtime(self.ap.first_seen))}\n\n"
+            "ESP32 sees this access point over the air. This does not prove a device is connected to your router."
+        )
+
+    def on_mount(self) -> None:
+        log = self.query_one("#router-detail-events", RichLog)
+        if self.ap.recent_events:
+            for line in self.ap.recent_events:
+                log.write(line)
+        else:
+            log.write("Waiting for ESP32 observations…")
+
+    def add_event(self, event: NetEvent) -> None:
+        raw = event.raw_data
+        mac = str(raw.get("mac", "")).upper()
+        bssid = str(raw.get("bssid", "")).upper()
+        if mac != self.ap.bssid and bssid != self.ap.bssid:
+            return
+        if event.source.value != "ESP32":
+            return
+        try:
+            self.query_one("#router-detail-events", RichLog).write(event.export_line())
+            self.query_one("#router-detail-body", Static).update(self._description())
+        except NoMatches:
+            pass
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "router-capture-start":
+            self.dismiss("start-capture")
+        elif event.button.id == "router-capture-stop":
+            self.dismiss("stop-capture")
+        elif event.button.id == "router-home-toggle":
+            self.dismiss("unset-home" if self.is_home else "set-home")
+        elif event.button.id == "router-close":
+            self.dismiss("close")
+
+    def action_close(self) -> None:
+        self.dismiss("close")
 
 
 
@@ -251,6 +357,11 @@ class NetScopeApp(App):
         self._session_paused: bool = False
         self._pause_start_time: float | None = None
         self._paused_discarded_count: int = 0
+        self._access_points: dict[str, AccessPoint] = {}
+        self._router_group = "others"
+        self._home_bssid = self._load_home_bssid()
+        self._raw_capture_bssid: str | None = None
+        self._router_list_dirty = False
 
 
 
@@ -268,6 +379,13 @@ class NetScopeApp(App):
                 )
                 yield Static(self._build_status_bar(), id="status-bar")
             with Vertical(id="sidebar"):
+                yield Static("[b u]📡 Wi-Fi access points[/b u]", classes="section-title")
+                with Horizontal(id="router-groups"):
+                    yield Button("My router", id="router-group-home", compact=True)
+                    yield Button("Others", id="router-group-others", compact=True, variant="primary")
+                yield Static("Click a point to open its live event feed.", id="router-hint")
+                with VerticalScroll(id="router-list"):
+                    yield Static("Waiting for ESP32 access-point frames…", id="router-empty")
                 yield Static("[b u]📊 Statistics[/b u]", classes="section-title")
                 yield Static("Events: 0", id="stat-events", classes="stat-label")
                 yield Static("IPs: 0", id="stat-ips", classes="stat-label")
@@ -294,6 +412,7 @@ class NetScopeApp(App):
         self._event_consumer_task = asyncio.create_task(self._consume_events())
         self._error_watcher_task = asyncio.create_task(self._watch_errors())
         self._stats_updater = self.set_interval(1.0, self._update_stats)
+        self._router_updater = self.set_interval(1.0, self._refresh_router_list)
 
     async def on_unmount(self) -> None:
         await self._stop_agents()
@@ -468,6 +587,9 @@ class NetScopeApp(App):
 
                 self._events.append(event)
                 self.total_events = len(self._events)
+                self._record_access_point(event)
+                if isinstance(self.screen, RouterDetails):
+                    self.screen.add_event(event)
 
 
                 for addr in (event.who, event.where):
@@ -572,6 +694,178 @@ class NetScopeApp(App):
             self.query_one("#status-bar", Static).update(self._build_status_bar())
         except NoMatches:
             pass
+
+    @staticmethod
+    def _home_file() -> Path:
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        return base / "ESP TraceHub" / "home_access_point.json"
+
+    @classmethod
+    def _load_home_bssid(cls) -> str | None:
+        try:
+            value = json.loads(cls._home_file().read_text(encoding="utf-8"))
+            bssid = value.get("bssid") if isinstance(value, dict) else None
+            if isinstance(bssid, str) and re.fullmatch(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}", bssid.upper()):
+                return bssid.upper()
+        except (OSError, ValueError, TypeError):
+            pass
+        return None
+
+    def _save_home_bssid(self) -> None:
+        path = self._home_file()
+        try:
+            if self._home_bssid:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({"bssid": self._home_bssid}), encoding="utf-8")
+            else:
+                path.unlink(missing_ok=True)
+        except OSError as exc:
+            self._log_write(f"[yellow]Could not save My router selection: {exc}[/yellow]")
+
+    def _record_access_point(self, event: NetEvent) -> None:
+        raw = event.raw_data
+        if event.source.value != "ESP32":
+            return
+        event_type = str(raw.get("type", "")).lower()
+        bssid = str(raw.get("mac", "")).upper()
+        if event_type == "data":
+            bssid = str(raw.get("bssid", "")).upper()
+        if event_type not in {"beacon", "probe_resp", "data"}:
+            return
+        if not re.fullmatch(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}", bssid):
+            return
+        ap = self._access_points.get(bssid)
+        if event_type == "data":
+            if ap is None:
+                return
+            ap.data_frames += 1
+            for address in (str(raw.get("src", "")).upper(), str(raw.get("dst", "")).upper()):
+                if address and address != bssid and re.fullmatch(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}", address):
+                    ap.clients.add(address)
+            ap.recent_events.append(event.export_line())
+            self._router_list_dirty = True
+            return
+        if ap is None:
+            ap = AccessPoint(
+                bssid=bssid,
+                ssid=_safe_text(raw.get("ssid", "")),
+                channel=_safe_text(raw.get("channel", "?"), 8),
+                rssi=_safe_text(raw.get("rssi", "?"), 8),
+                first_seen=event.timestamp,
+            )
+            self._access_points[bssid] = ap
+        ap.ssid = _safe_text(raw.get("ssid", ap.ssid))
+        ap.channel = _safe_text(raw.get("channel", ap.channel), 8)
+        ap.rssi = _safe_text(raw.get("rssi", ap.rssi), 8)
+        ap.last_seen = event.timestamp
+        ap.observations += 1
+        ap.recent_events.append(event.export_line())
+        self._router_list_dirty = True
+
+    def _refresh_router_list(self) -> None:
+        if not self._router_list_dirty:
+            return
+        try:
+            container = self.query_one("#router-list", VerticalScroll)
+        except NoMatches:
+            return
+        self._router_list_dirty = False
+        aps = sorted(self._access_points.values(), key=lambda ap: ap.last_seen, reverse=True)
+        visible = [ap for ap in aps if (ap.bssid == self._home_bssid) == (self._router_group == "home")]
+        widgets: list[Button | Static] = []
+        if not visible:
+            message = "No router marked yet. Open an access point under Others and set it as My router." if self._router_group == "home" else "No access points observed yet. Check that ESP32 is scanning 2.4 GHz Wi-Fi."
+            widgets.append(Static(message, id="router-empty"))
+        else:
+            for ap in visible:
+                label = f"{'★ ' if ap.bssid == self._home_bssid else ''}{ap.ssid}\n{ap.bssid} · ch{ap.channel} · {ap.rssi} dBm · {ap.data_frames} data samples"
+                widgets.append(Button(label, id=f"ap-{ap.bssid.replace(':', '')}", classes="router-button", variant="primary" if ap.bssid == self._home_bssid else "default"))
+
+        async def replace_children() -> None:
+            await container.remove_children()
+            await container.mount(*widgets)
+
+        self.call_later(replace_children)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if button_id == "router-group-home":
+            self._router_group = "home"
+        elif button_id == "router-group-others":
+            self._router_group = "others"
+        elif button_id.startswith("ap-"):
+            compact_bssid = button_id[3:]
+            bssid = ":".join(compact_bssid[index:index + 2] for index in range(0, 12, 2))
+            ap = self._access_points.get(bssid)
+            if ap:
+                self.push_screen(
+                    RouterDetails(ap, bssid == self._home_bssid, bssid == self._raw_capture_bssid),
+                    callback=lambda result: self._handle_router_detail_result(bssid, result),
+                )
+            return
+        else:
+            return
+        self.query_one("#router-group-home", Button).variant = "primary" if self._router_group == "home" else "default"
+        self.query_one("#router-group-others", Button).variant = "primary" if self._router_group == "others" else "default"
+        self._router_list_dirty = True
+        self._refresh_router_list()
+
+    def _handle_router_detail_result(self, bssid: str, result: str | None) -> None:
+        if result == "start-capture":
+            asyncio.create_task(self._start_raw_capture(bssid))
+            return
+        if result == "stop-capture":
+            asyncio.create_task(self._stop_raw_capture())
+            return
+        if result == "set-home":
+            self._home_bssid = bssid
+            self._save_home_bssid()
+        elif result == "unset-home":
+            self._home_bssid = None
+            self._save_home_bssid()
+        else:
+            return
+        self._router_list_dirty = True
+        self._refresh_router_list()
+
+    async def _start_raw_capture(self, bssid: str) -> None:
+        ap = self._access_points.get(bssid)
+        agent = self.esp_agent
+        if ap is None or agent is None or not agent.status.connected:
+            self._log_write("[bold red]Raw capture failed: ESP32 is not connected or the AP is unavailable.[/bold red]")
+            return
+        try:
+            channel = int(ap.channel)
+        except ValueError:
+            self._log_write("[bold red]Raw capture failed: the AP channel is unknown.[/bold red]")
+            return
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        capture_dir = base / "ESP TraceHub" / "captures"
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        path = capture_dir / f"wifi-{timestamp}-{bssid.replace(':', '')}.pcap"
+        try:
+            await agent.start_raw_capture(channel, bssid, path)
+        except Exception as exc:
+            self._log_write(f"[bold red]Raw capture failed: {exc}[/bold red]")
+            return
+        self._raw_capture_bssid = bssid
+        self._log_write(
+            f"[bold green]Raw Wi-Fi capture started for {ap.ssid} ({bssid}) on channel {channel}. "
+            f"File: {path}[/bold green]"
+        )
+
+    async def _stop_raw_capture(self) -> None:
+        agent = self.esp_agent
+        if agent is None:
+            return
+        try:
+            path = await agent.stop_raw_capture()
+        except Exception as exc:
+            self._log_write(f"[bold red]Could not stop raw capture: {exc}[/bold red]")
+            return
+        self._raw_capture_bssid = None
+        if path is not None:
+            self._log_write(f"[bold green]Raw capture saved to {path}. Open it in Wireshark.[/bold green]")
 
     def _agent_indicator(self, agent: Any) -> str:
         if agent is None:

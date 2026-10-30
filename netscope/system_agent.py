@@ -82,7 +82,7 @@ class SystemAgent:
                     continue
                 try:
                     output = await loop.run_in_executor(None, self._run_netstat)
-                    new_conns = self._parse_netstat(output)
+                    new_conns = await loop.run_in_executor(None, self._parse_netstat, output)
                     if self.paused:
                         self.discarded_count += sum(
                             1
@@ -140,6 +140,7 @@ class SystemAgent:
     def _parse_netstat(self, output: str) -> list[dict[str, Any]]:
         """Parse netstat -ano output into connection dicts."""
         results: list[dict[str, Any]] = []
+        process_names: dict[int, str] = {}
         for line in output.splitlines():
             line = line.strip()
             if not line:
@@ -164,7 +165,10 @@ class SystemAgent:
             if "127.0.0.1" in (remote.split(":")[0] if ":" in remote else remote):
                 continue
 
-            process_name = self._get_process_name(int(pid))
+            pid_value = int(pid)
+            if pid_value not in process_names:
+                process_names[pid_value] = self._get_process_name(pid_value)
+            process_name = process_names[pid_value]
 
             results.append({
                 "_source": "system_conn",

@@ -17,6 +17,30 @@ from netscope.system_agent import SystemAgent
 
 
 class TestTargeted(unittest.IsolatedAsyncioTestCase):
+    def test_wifi_data_frame_parser_and_readable_event(self):
+        line = (
+            "EVT:DATA MAC:AA:BB:CC:DD:EE:01 SRC=AA:BB:CC:DD:EE:01 "
+            "DST=AA:BB:CC:DD:EE:FF BSSID=AA:BB:CC:DD:EE:FF "
+            "DIR=CLIENT_TO_AP LEN=512 SUBTYPE=8 TID=5 PROTECTED=1 RETRY=1 PM=1 SEQ=42 RSSI=-54 CHAN=6"
+        )
+        raw = ESPAgent._parse_evt(line)
+        self.assertIsNotNone(raw)
+        assert raw is not None
+        self.assertEqual(raw["direction"], "CLIENT_TO_AP")
+        self.assertEqual(raw["length"], "512")
+        self.assertEqual(raw["protected"], "1")
+        self.assertEqual(raw["retry"], "1")
+        self.assertEqual(raw["subtype"], "8")
+        self.assertEqual(raw["qos_tid"], "5")
+        event = EventEngine()._transform_esp32(raw)[0]
+        self.assertEqual(event.who, "Client AA:BB:CC:DD:EE:01")
+        self.assertEqual(event.where, "AP AA:BB:CC:DD:EE:FF")
+        self.assertIn("512-byte 802.11 frame", event.what)
+        self.assertIn("encrypted payload; contents unavailable", event.what)
+        self.assertIn("retransmission flag set", event.what)
+        self.assertIn("QoS priority/TID 5", event.what)
+        self.assertIn("power-save flag set", event.what)
+
     async def test_watchdog_real_loop(self):
         error_mgr = ErrorManager()
         queue: asyncio.Queue = asyncio.Queue()
@@ -480,7 +504,9 @@ class TestTargeted(unittest.IsolatedAsyncioTestCase):
         entered = asyncio.Event()
         release = asyncio.Event()
 
-        async def delayed_executor(executor, func):
+        async def delayed_executor(executor, func, *args):
+            if func is parse_mock:
+                return connections
             entered.set()
             await release.wait()
             return "snapshot"
@@ -493,7 +519,7 @@ class TestTargeted(unittest.IsolatedAsyncioTestCase):
             "pid": "42",
         }]
         with patch.object(loop, "run_in_executor", side_effect=delayed_executor):
-            with patch.object(agent, "_parse_netstat", return_value=connections):
+            with patch.object(agent, "_parse_netstat", return_value=connections) as parse_mock:
                 task = asyncio.create_task(agent._netstat_loop())
                 await asyncio.wait_for(entered.wait(), timeout=1)
                 agent.pause()
@@ -505,6 +531,35 @@ class TestTargeted(unittest.IsolatedAsyncioTestCase):
 
                 task.cancel()
                 await task
+
+    async def test_netstat_parsing_does_not_block_event_loop(self):
+        agent = SystemAgent(asyncio.Queue(), poll_interval=0.01)
+        ticks = 0
+
+        def slow_parse(output):
+            time.sleep(0.2)
+            return []
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        ticker_task = asyncio.create_task(ticker())
+        with patch.object(agent, "_run_netstat", return_value="snapshot"):
+            with patch.object(agent, "_parse_netstat", side_effect=slow_parse):
+                netstat_task = asyncio.create_task(agent._netstat_loop())
+                await asyncio.sleep(0.08)
+                self.assertGreaterEqual(ticks, 4)
+
+                netstat_task.cancel()
+                ticker_task.cancel()
+                await netstat_task
+                try:
+                    await ticker_task
+                except asyncio.CancelledError:
+                    pass
 
     async def test_system_dns_result_is_discarded_if_paused_in_flight(self):
         queue: asyncio.Queue = asyncio.Queue()

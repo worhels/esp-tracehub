@@ -6,6 +6,8 @@ import asyncio
 import re
 from typing import Any
 
+from rich.markup import escape
+
 from .models import AlertLevel, NetEvent, Source
 
 
@@ -242,63 +244,146 @@ class EventEngine:
 
 
     def _transform_esp32(self, raw: dict[str, Any]) -> list[NetEvent]:
-        evt_type = raw.get("type", "unknown")
-        mac = raw.get("mac", "??:??:??:??:??:??")
-        rssi = raw.get("rssi", "?")
-        channel = raw.get("channel", "?")
-        ssid = raw.get("ssid", "")
+        evt_type = str(raw.get("type", "unknown")).lower()
+        mac = str(raw.get("mac", "??:??:??:??:??:??")).upper()
+        src = str(raw.get("src", mac)).upper()
+        dst = str(raw.get("dst", "unknown destination")).upper()
+        bssid = str(raw.get("bssid", "unknown BSSID")).upper()
+        rssi = str(raw.get("rssi", "?"))
+        channel = str(raw.get("channel", "?"))
+        ssid = escape(str(raw.get("ssid", "")))
+
+        if dst == "FF:FF:FF:FF:FF:FF":
+            destination = "broadcast"
+        elif dst == "00:00:00:00:00:00":
+            destination = "unspecified"
+        else:
+            destination = dst
+        ap = bssid if bssid != "00:00:00:00:00:00" else "unknown AP"
+        signal = f"RSSI {rssi} dBm, channel {channel}"
 
         if evt_type in ("probe", "probe_req"):
-            what = f"Probe request ch{channel} RSSI {rssi}"
-            if ssid:
-                what += f" SSID=\"{ssid}\""
+            target = f" for network \"{ssid}\"" if ssid else " (network name not advertised)"
             return [NetEvent(
-                source=Source.ESP32, who=mac, where=f"ch{channel}",
-                what=what, alert_level=AlertLevel.INFO, raw_data=raw,
+                source=Source.ESP32, who=f"Device {src}",
+                where=f"{destination} / BSSID {ap}",
+                what=f"Searching{target}; {signal}",
+                alert_level=AlertLevel.INFO, raw_data=raw,
             )]
         elif evt_type in ("probe_resp",):
-            what = f"Probe response ch{channel} RSSI {rssi}"
-            if ssid:
-                what += f" SSID=\"{ssid}\""
+            network = f" for network \"{ssid}\"" if ssid else ""
             return [NetEvent(
-                source=Source.ESP32, who=mac, where=f"ch{channel}",
-                what=what, alert_level=AlertLevel.INFO, raw_data=raw,
+                source=Source.ESP32, who=f"AP {ssid or ap} ({src})",
+                where=f"{destination} / BSSID {ap}",
+                what=f"Replies to a Wi-Fi search{network}; {signal}",
+                alert_level=AlertLevel.INFO, raw_data=raw,
             )]
         elif evt_type in ("beacon",):
-            what = f"Beacon ch{channel} RSSI {rssi}"
-            if ssid:
-                what += f" SSID=\"{ssid}\""
+            network = f"network \"{ssid}\"" if ssid else "hidden network"
             return [NetEvent(
-                source=Source.ESP32, who=mac, where=f"ch{channel}",
-                what=what, alert_level=AlertLevel.INFO, raw_data=raw,
+                source=Source.ESP32, who=f"AP {ssid or ap} ({src})",
+                where=f"{destination} / BSSID {ap}",
+                what=f"Advertises {network}; {signal}",
+                alert_level=AlertLevel.INFO, raw_data=raw,
             )]
         elif evt_type in ("assoc_req", "assoc"):
-            what = f"Association request ch{channel} RSSI {rssi}"
-            if ssid:
-                what += f" SSID=\"{ssid}\""
+            network = f"network \"{ssid}\"" if ssid else f"AP {ap}"
             return [NetEvent(
-                source=Source.ESP32, who=mac, where=f"ch{channel}",
-                what=what, alert_level=AlertLevel.NOTICE, raw_data=raw,
+                source=Source.ESP32, who=f"Device {src}",
+                where=f"AP {ap} ({destination})",
+                what=f"Requests association with {network}; not yet confirmed; {signal}",
+                alert_level=AlertLevel.NOTICE, raw_data=raw,
             )]
         elif evt_type in ("assoc_resp",):
+            status = str(raw.get("status", "unknown"))
+            outcome = "accepted" if status == "0" else "rejected" if status.isdigit() else "response status unavailable"
             return [NetEvent(
-                source=Source.ESP32, who=mac, where=f"ch{channel}",
-                what=f"Association response ch{channel} RSSI {rssi}",
+                source=Source.ESP32, who=f"AP {ap} ({src})",
+                where=f"Device {destination}",
+                what=f"Association {outcome} (status {status}); {signal}",
                 alert_level=AlertLevel.NOTICE, raw_data=raw,
             )]
         elif evt_type in ("new_device",):
+            observed_bssid = str(raw.get("bssid", "")).upper()
+            location = f"BSSID {observed_bssid}" if observed_bssid != "00:00:00:00:00:00" else "2.4 GHz air"
             return [NetEvent(
-                source=Source.ESP32, who=mac, where="2.4GHz",
-                what=f"New Wi-Fi device detected! RSSI {rssi}",
+                source=Source.ESP32, who=f"Device {mac}", where=location,
+                what=f"First Wi-Fi frame from this MAC observed; connection state not confirmed; {signal}",
                 alert_level=AlertLevel.NOTICE, raw_data=raw,
             )]
         elif evt_type == "deauth":
             reason = raw.get("reason", "")
-            reason_str = f" (code {reason})" if reason else ""
             return [NetEvent(
-                source=Source.ESP32, who=mac, where=f"ch{channel}",
-                what=f"Deauth frame detected{reason_str} RSSI {rssi}",
+                source=Source.ESP32, who=f"{src}",
+                where=f"{destination} / BSSID {ap}",
+                what=f"Sends a disconnect (deauthentication) frame; reason {reason or 'unknown'}; {signal}",
                 alert_level=AlertLevel.WARNING, raw_data=raw,
+            )]
+        elif evt_type == "data":
+            direction = str(raw.get("direction", "DIRECT"))
+            frame_len = str(raw.get("length", "unknown"))
+            protected = str(raw.get("protected", "0")) == "1"
+            retry = str(raw.get("retry", "0")) == "1"
+            sequence = str(raw.get("sequence", "unknown"))
+            subtype_raw = str(raw.get("subtype", "unknown"))
+            try:
+                subtype = int(subtype_raw)
+            except ValueError:
+                subtype = -1
+            subtype_names = {
+                0: "Data",
+                1: "Data + CF-Ack",
+                2: "Data + CF-Poll",
+                3: "Data + CF-Ack/Poll",
+                4: "Null data (no payload)",
+                5: "CF-Ack (no payload)",
+                6: "CF-Poll (no payload)",
+                7: "CF-Ack/Poll (no payload)",
+                8: "QoS data",
+                9: "QoS data + CF-Ack",
+                10: "QoS data + CF-Poll",
+                11: "QoS data + CF-Ack/Poll",
+                12: "QoS Null (no payload)",
+            }
+            subtype_name = subtype_names.get(subtype, f"data subtype {subtype_raw}")
+            no_payload = subtype in {4, 5, 6, 7, 12, 13, 14, 15}
+            payload_text = (
+                "no user payload in this frame"
+                if no_payload
+                else "encrypted payload; contents unavailable"
+                if protected
+                else "payload not decoded"
+            )
+            retry_text = "; retransmission flag set" if retry else ""
+            sequence_text = f"; sequence {sequence}" if sequence != "unknown" else ""
+            try:
+                qos_tid = int(str(raw.get("qos_tid", "255")))
+            except ValueError:
+                qos_tid = 255
+            qos_text = f"; QoS priority/TID {qos_tid}" if 0 <= qos_tid <= 15 else ""
+            power_save_text = "; power-save flag set" if str(raw.get("power_save", "0")) == "1" else ""
+
+            if direction == "CLIENT_TO_AP":
+                who = f"Client {src}"
+                where = f"AP {ap}"
+                action = "Sends a frame to the access point"
+            elif direction == "AP_TO_CLIENT":
+                who = f"AP {ap}"
+                where = f"Client {destination}"
+                action = "Sends a frame to a client"
+            elif direction == "WDS_HOP":
+                who = f"Radio {src}"
+                where = f"Next hop {destination}"
+                action = "Forwards a WDS frame; endpoints and AP are unknown"
+            else:
+                who = f"Device {src}"
+                where = destination
+                action = "Sends a direct Wi-Fi frame"
+
+            return [NetEvent(
+                source=Source.ESP32, who=who, where=where,
+                what=f"{action}; {subtype_name}; {frame_len}-byte 802.11 frame; {payload_text}{qos_text}{retry_text}{power_save_text}{sequence_text}; {signal}; sample limited to 10 frames/s",
+                alert_level=AlertLevel.INFO, raw_data=raw,
             )]
         elif evt_type == "heartbeat":
             uptime = raw.get("uptime", "0")
