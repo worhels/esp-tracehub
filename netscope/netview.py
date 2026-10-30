@@ -306,7 +306,7 @@ class ErrorOverlay(ModalScreen[str]):
 
 
 
-class NetScopeApp(App):
+class NetScopeApp(App[None]):
     """The NETSCOPE real-time network monitoring TUI."""
 
     TITLE = "NETSCOPE"
